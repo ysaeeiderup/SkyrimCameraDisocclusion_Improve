@@ -1,110 +1,28 @@
 #include "Hook.h"
-#include "RE/P/PlayerCharacter.h"
-#include "RE/P/PlayerCamera.h"
-#include "RE/T/TESObjectCELL.h"
-#include "RE/B/bhkWorld.h"
-#include "RE/B/bhkPickData.h"
-#include "RE/H/hkpWorldRayCastInput.h"
-#include "RE/H/hkpWorldRayCastOutput.h"
-#include "RE/T/TESHavokUtilities.h"
-#include "RE/T/TESObjectREFR.h"
-#include "RE/N/NiPoint3.h"
-#include "RE/N/NiAVObject.h"
-#include "RE/N/NiNode.h"
-#include "RE/B/BSShader.h"
-#include "RE/B/BSRenderPass.h"
-#include "RE/B/BSPortalGraph.h"
-#include "RE/B/BSMultiBoundNode.h"
-#include "RE/B/BSMultiBoundRoom.h"
-#include "RE/B/BSOcclusionPlane.h"
-#include "RE/B/BSOcclusionBox.h"
-#include "RE/S/Sky.h"
 #include "Settings.h"
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include "RE/C/CFilter.h"
 #include <cmath>
-#include <string>
 #include <Windows.h>
+#include <MinHook.h>
 
 namespace Hooks
 {
 	struct HitEntry
 	{
-		// Bumps the NiRefObject refcount so the engine can't free the mesh while we
-		// have it in the map. The raw key pointer is never dereferenced — only used
-		// for hashing in Update and as a comparison target in the render-pass thunk.
 		RE::NiPointer<RE::NiAVObject> keepalive;
 		float                         secondsSinceSeen;
 		float                         distFromCamera;
 	};
-	// Owned by HookPlayerCharacter::Update only. We assume Update is called serially
-	// on a single thread (Skyrim's main actor-update loop is single-threaded
-	// per frame), so this map is mutated without locking. No other code reads from
-	// it directly — they read the atomic snapshots below.
 	static std::unordered_map<RE::NiAVObject*, HitEntry> g_hitObjects;
 
-	// Atomic snapshots published by Update each frame, consumed by the BSLightingShader
-	// render-pass thunk and the ClearRTV hook. We don't know which thread(s) call
-	// those — could be the same thread as Update, could be a separate render-submit
-	// thread — so all access goes through atomic load/store with acquire/release
-	// ordering. The shared_ptr publish pattern means consumers see a consistent
-	// snapshot even if Update rebuilds mid-load; old snapshots free themselves once
-	// no consumer is holding them.
 	using HitSet = std::unordered_set<RE::NiAVObject*>;
 	static std::atomic<std::shared_ptr<const HitSet>> g_publishedHits;
 	static std::atomic<float>                         g_clipDistance{ 0.0f };
-
-	// Published once per StripGraph call on interior cells: the set of rooms in the
-	// player's portal graph, plus a keepalive on the graph itself so the engine
-	// can't free it under us. The QPointWithin thunk loads this lock-free and
-	// returns true for any of these rooms while see-through is engaged, making
-	// the engine's visibility walk seed from every room in the cell.
-	struct ForceVisRecord
-	{
-		RE::NiPointer<RE::BSPortalGraph>          graphKeepalive;
-		std::unordered_set<RE::BSMultiBoundRoom*> rooms;
-	};
-	static std::atomic<std::shared_ptr<const ForceVisRecord>> g_forceVisRecord;
-
-	// Feature gates. Default-true; kept as toggles so each feature can be disabled
-	// at compile time without ripping out the implementation.
-	//   kEnableStripper   — install OcclusionStripper event sinks + run the
-	//                       per-tick refresh that drives the position-displace
-	//                       outdoor strip (writes shape translations to a
-	//                       far-away point so they occlude nothing, restores
-	//                       on toggle-off).
-	//   kInstallQPoint    — install BSMultiBoundRoom::QPointWithin vtable hook.
-	//                       While see-through is engaged in an interior, the hook
-	//                       returns true for every room in the player's cell graph,
-	//                       making the engine's visibility walk seed from every
-	//                       room and the whole cell render regardless of where
-	//                       the camera floats.
-	//   kPublishIndoor    — populate g_forceVisRecord during interior StripGraph
-	//                       so the QPointWithin thunk can identify rooms.
-	//   kFindPlayerRoom   — walk the cell graph in Update each tick to cache the
-	//                       player's BSMultiBoundRoom (used by the QPointWithin
-	//                       redirect to pick the seed room for visibility walking).
-	constexpr bool kEnableStripper  = true;
-	constexpr bool kInstallQPoint   = true;
-	constexpr bool kPublishIndoor   = true;
-	constexpr bool kFindPlayerRoom  = true;
-
-	// The room the engine's own QPointWithin says contains the player, refreshed
-	// every frame in HookPlayerCharacter::Update. Used as a binary "is the player
-	// in some interior room?" signal by the QPointWithin thunk — when non-null and
-	// see-through is engaged, the thunk returns true for every room in the player's
-	// cell graph, making the engine's visibility walk seed from every room and the
-	// whole cell render regardless of where the camera floats.
-	static std::atomic<RE::BSMultiBoundRoom*> g_playerRoom{ nullptr };
-
-	// HookQPointWithin is defined further down (it depends on g_forceVisRecord/g_playerRoom
-	// declared above). Update needs to dispatch through its `func` trampoline to ask the
-	// engine's real QPointWithin which room the player is in, so forward-declare a tiny
-	// helper here and define it after the struct.
-	namespace { bool CallOrigQPointWithin(RE::BSMultiBoundRoom* a_room, RE::NiPoint3& a_point); }
 
 	static void UpdateCameraData()
 	{
@@ -113,20 +31,15 @@ namespace Hooks
 		func();
 	}
 
-	// Hook ID3D11DeviceContext::ClearRenderTargetView (vtbl index 50). The engine's
-	// back-buffer clear passes &RendererData2::clearColor as the color pointer; we
-	// detect that exact pointer and substitute black while clipping. Other clears
-	// (shadow maps, post-fx targets, ENB/ReShade) pass different pointers and are
-	// untouched, and we always call the original — so chained hooks still see the call.
-	using ClearRTV_t = void(STDMETHODCALLTYPE*)(REX::W32::ID3D11DeviceContext*, REX::W32::ID3D11RenderTargetView*, const float[4]);
+	using ClearRTV_t = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11RenderTargetView*, const float[4]);
 	static ClearRTV_t s_origClearRTV = nullptr;
 
-	static void STDMETHODCALLTYPE HookedClearRTV(REX::W32::ID3D11DeviceContext* a_ctx, REX::W32::ID3D11RenderTargetView* a_rtv, const float a_color[4])
+	static void STDMETHODCALLTYPE HookedClearRTV(ID3D11DeviceContext* a_ctx, ID3D11RenderTargetView* a_rtv, const float a_color[4])
 	{
-		if (g_clipDistance.load(std::memory_order_relaxed) > 0.0f && a_color) {
+		if (g_clipDistance.load(std::memory_order_relaxed) > 0.0f && a_rtv) {
 			if (auto* renderer = RE::BSGraphics::Renderer::GetSingleton()) {
-				auto& rdata = renderer->GetRendererData();
-				if (a_color == &rdata.clearColor[0]) {
+				auto& mainTarget = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+				if (a_rtv == mainTarget.RTV) {
 					const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
 					s_origClearRTV(a_ctx, a_rtv, black);
 					return;
@@ -151,7 +64,7 @@ namespace Hooks
 			return;
 		}
 		void** vtbl = *reinterpret_cast<void***>(ctx);
-		constexpr std::size_t kClearRTVIndex = 50; // ID3D11DeviceContext::ClearRenderTargetView
+		constexpr std::size_t kClearRTVIndex = 50;
 		DWORD oldProtect = 0;
 		if (!VirtualProtect(&vtbl[kClearRTVIndex], sizeof(void*), PAGE_READWRITE, &oldProtect)) {
 			return;
@@ -183,11 +96,6 @@ namespace Hooks
 			auto shadowState = RE::BSGraphics::RendererShadowState::GetSingleton();
 			if (shadowState) {
 				auto& data = shadowState->GetRuntimeData();
-				// data.cameraData is EYE_POSITION<ViewData> — a wrapper whose only member
-				// is `T eye[size]`. The wrapper's getEye() returns by value, no good for
-				// mutating projMat/viewProjMat below. Reinterpret to ViewData& works
-				// because the wrapper's memory layout IS the underlying array (size=1 in
-				// flat, size=2 in VR — we always want eye 0).
 				auto& cameraData = *reinterpret_cast<RE::BSGraphics::ViewData*>(&data.cameraData);
 
 				if (std::abs(cameraData.projMat._34 - 1.0f) < 0.01f && std::abs(cameraData.projMat._43) < 50.0f) {
@@ -200,13 +108,13 @@ namespace Hooks
 
 						auto context = RE::BSGraphics::Renderer::GetSingleton()->GetRuntimeData().context;
 						std::uint32_t numViewports = 1;
-						REX::W32::D3D11_VIEWPORT origViewport;
-						context->RSGetViewports(&numViewports, &origViewport);
+						REX::W32::D3D11_VIEWPORT viewport;
+						context->RSGetViewports(&numViewports, &viewport);
 
-						REX::W32::D3D11_VIEWPORT newViewport = origViewport;
-						float minDepthShift = 1.0f - (origNear / clipDist);
-						newViewport.minDepth = origViewport.minDepth + minDepthShift * (origViewport.maxDepth - origViewport.minDepth);
-						context->RSSetViewports(1, &newViewport);
+						const float origMinDepth = viewport.minDepth;
+						const float minDepthShift = 1.0f - (origNear / clipDist);
+						viewport.minDepth = origMinDepth + minDepthShift * (viewport.maxDepth - origMinDepth);
+						context->RSSetViewports(1, &viewport);
 
 						cameraData.projMat._43 = -clipDist;
 						cameraData.viewProjMat = cameraData.viewMat * cameraData.projMat;
@@ -215,8 +123,13 @@ namespace Hooks
 
 						UpdateCameraData();
 						func(a_pass, a_technique, a_alphaTest, a_renderFlags);
-						
-						context->RSSetViewports(1, &origViewport);
+
+						// Re-read current D3D viewport so we don't clobber any field
+						// func() may have updated mid-pass; restore only minDepth.
+						context->RSGetViewports(&numViewports, &viewport);
+						viewport.minDepth = origMinDepth;
+						context->RSSetViewports(1, &viewport);
+
 						cameraData.projMat = origProj;
 						cameraData.viewProjMat = origViewProj;
 						cameraData.projMatrixUnjittered = origProjUnj;
@@ -238,7 +151,7 @@ namespace Hooks
 	void HookPlayerCharacter::Update(RE::Actor* a_this, float a_delta)
 	{
 		_Update(a_this, a_delta);
-		if (!a_this || !a_this->IsPlayerRef()) {
+		if (!a_this || !a_this->IsPlayerRef() || !a_this->Is3DLoaded()) {
 			return;
 		}
 
@@ -257,12 +170,6 @@ namespace Hooks
 			return;
 		}
 
-		// Hide the sky scene-subtree only when see-through is actively engaged
-		// AND the player is in an interior. Sets kHidden on Sky::root so the
-		// renderer skips the entire sky subtree (sun, moons, stars, clouds, aurora,
-		// atmosphere) without touching Sky::mode, weather, or any downstream
-		// lighting state. Default interior play (no see-through, e.g. just
-		// looking out a Dragonsreach skylight) keeps sky visible.
 		if (auto* sky = RE::Sky::GetSingleton()) {
 			if (auto* skyRoot = sky->root.get()) {
 				const bool seeThroughActive = g_clipDistance.load(std::memory_order_acquire) > 0.0f;
@@ -271,36 +178,9 @@ namespace Hooks
 			}
 		}
 
-		// Identify the room the player is in (interior cells only). Walk the cell's
-		// portal graph and call the engine's real QPointWithin via the trampoline —
-		// never the thunk, which would recurse on this logic. The QPointWithin
-		// thunk uses the cached pointer to gate its override (only fires when
-		// non-null = player is in some room of an interior with a portal graph).
-		// kFindPlayerRoom needs kInstallQPoint — the helper dispatches through the
-		// QPointWithin trampoline, which is only populated by Install().
-		static_assert(!kFindPlayerRoom || kInstallQPoint, "kFindPlayerRoom requires kInstallQPoint");
-		RE::BSMultiBoundRoom* foundRoom = nullptr;
-		if (kFindPlayerRoom && parentCell->IsInteriorCell()) {
-			if (auto* loaded = parentCell->GetRuntimeData().loadedData) {
-				if (auto* graph = loaded->portalGraph.get()) {
-					for (auto& roomPtr : graph->rooms) {
-						if (auto* room = roomPtr.get()) {
-							RE::NiPoint3 pp = playerPos;  // by-ref; engine may mutate
-							if (CallOrigQPointWithin(room, pp)) {
-								foundRoom = room;
-								break;
-							}
-						}
-					}
-				}
-			}
-		}
-		g_playerRoom.store(foundRoom, std::memory_order_release);
-
 		float scale = RE::bhkWorld::GetWorldScale();
 		RE::CFilter colFilter;
 		a_this->GetCollisionFilterInfo(colFilter);
-		// Age existing entries; new hits will reset to 0 below.
 		for (auto& [obj, entry] : g_hitObjects) {
 			entry.secondsSinceSeen += a_delta;
 		}
@@ -313,7 +193,6 @@ namespace Hooks
 		}
 		const RE::NiPoint3 dir = ray * (1.0f / totalDist);
 
-		// Build an orthonormal basis (u, v) perpendicular to dir for fanning rays.
 		RE::NiPoint3 u = dir.Cross(RE::NiPoint3{ 0.0f, 0.0f, 1.0f });
 		if (const float uLen = u.Length(); uLen < 1e-3f) {
 			u = { 1.0f, 0.0f, 0.0f };
@@ -322,11 +201,8 @@ namespace Hooks
 		}
 		const RE::NiPoint3 vBase = dir.Cross(u);
 
-		// Rotate the sample angles by the golden angle each frame so successive frames
-		// fill in different points around the disc. Combined with Settings::HitLingerSeconds of
-		// hysteresis this gives a dense, non-repeating sample without more rays/frame.
 		static std::uint32_t s_fanFrame = 0;
-		constexpr float      kGoldenAngle = 2.39996323f;  // radians, ~137.5°
+		constexpr float      kGoldenAngle = 2.39996323f;
 		const float          phase        = s_fanFrame++ * kGoldenAngle;
 
 		auto* selfRoot = a_this->Get3D();
@@ -334,9 +210,6 @@ namespace Hooks
 		constexpr int   kMaxHits     = 8;
 		constexpr float kStepEpsilon = 2.0f;
 
-		// Bias the fan into an ellipse: wider horizontally than vertically. Most
-		// occluders that matter for a chase cam are walls/columns to the sides; the
-		// floor/ceiling above and below rarely need clipping, so don't waste rays there.
 		auto ellipse = [&](float a_baseAngle) {
 			const float a = a_baseAngle + phase;
 			return u * (std::cos(a) * Settings::FanRadiusH) + vBase * (std::sin(a) * Settings::FanRadiusV);
@@ -354,6 +227,8 @@ namespace Hooks
 			ellipse(kPi * 1.75f),
 		};
 
+		{
+		RE::BSReadLockGuard worldLock(bhkWorld->worldLock);
 		for (const auto& offset : offsets) {
 			const RE::NiPoint3 rayFromBase = cameraPos + offset;
 			const RE::NiPoint3 rayToBase   = playerPos + offset;
@@ -373,30 +248,22 @@ namespace Hooks
 				const float segLen            = totalDist - start;
 				const float hitDistFromCamera = start + segLen * pick.rayOutput.hitFraction;
 
-				// Climb to the REFR's 3D root so all sub-meshes (scaffolding, trim,
-				// separate draw calls under the same building) share one ancestor.
 				auto* refr = RE::TESHavokUtilities::FindCollidableRef(*pick.rayOutput.rootCollidable);
 				RE::NiAVObject* root = refr ? refr->Get3D() : nullptr;
 				if (!root) {
 					root = RE::TESHavokUtilities::FindCollidableObject(*pick.rayOutput.rootCollidable);
 				}
-				// Reject floor-ish surfaces by face-normal regardless of collision layer.
-				// Skyrim authors roads/paths/floors as plain kStatic, so the layer alone
-				// can't tell them from walls — but a near-vertical hit normal (within ~45°
-				// of world up) can. Havok normals are +Z-up, same as the engine.
 				const bool isFloorish = std::abs(pick.rayOutput.normal.Dot3({ 0.0f, 0.0f, 1.0f, 0.0f })) > 0.7f;
 
-				if (!isFloorish && root && root != selfRoot && refr != a_this) {
-					// Read the layer from the hit collidable directly. NiAVObject::GetCollisionLayer
-					// only inspects the root's own collision object; doors and other compound
-					// meshes carry collision on a child node and would otherwise report kUnidentified.
+				const bool isLightFixture = refr && refr->GetBaseObject() &&
+				                            refr->GetBaseObject()->As<RE::TESObjectLIGH>();
+
+				if (!isFloorish && !isLightFixture && root && root != selfRoot && refr != a_this) {
 					const auto colLayer = pick.rayOutput.rootCollidable->GetCollisionLayer();
 					if (colLayer == RE::COL_LAYER::kStatic || colLayer == RE::COL_LAYER::kAnimStatic) {
 						auto [it, inserted] = g_hitObjects.try_emplace(root, HitEntry{ RE::NiPointer<RE::NiAVObject>(root), 0.0f, hitDistFromCamera });
 						auto& entry = it->second;
 						entry.secondsSinceSeen = 0.0f;
-						// Only grow distance within the linger window — fan rays hitting the
-						// same wall at slightly closer points must not pull the clip plane back.
 						if (!inserted && hitDistFromCamera > entry.distFromCamera) {
 							entry.distFromCamera = hitDistFromCamera;
 						}
@@ -410,17 +277,12 @@ namespace Hooks
 				}
 			}
 		}
+		}
 
-		// Drop entries that haven't been re-hit recently.
 		std::erase_if(g_hitObjects, [](const auto& kv) {
 			return kv.second.secondsSinceSeen > Settings::HitLingerSeconds;
 		});
 
-		// Build the publish snapshot and find the furthest hit in one pass. The
-		// release on the publishedHits store pairs with the acquire load in the
-		// consumer hook so the set's contents are visible. clipDistance is released
-		// after, so any observer seeing a non-zero clip is guaranteed to see the
-		// matching set.
 		auto  snap     = std::make_shared<HitSet>();
 		float furthest = 0.0f;
 		snap->reserve(g_hitObjects.size());
@@ -433,10 +295,7 @@ namespace Hooks
 		g_publishedHits.store(std::shared_ptr<const HitSet>(std::move(snap)), std::memory_order_release);
 		g_clipDistance.store(g_hitObjects.empty() ? 0.0f : furthest + 15.0f, std::memory_order_release);
 
-		// Strip linger is short (absorbs ray-miss frames) but well below the visual
-		// linger, so occluders snap back on once you actually stop looking through
-		// walls. Visual shift still rides the longer HitLingerSeconds for smoothness.
-		static float s_secondsSinceHit = 1e6f;  // huge so first frame doesn't strip
+		static float s_secondsSinceHit = 1e6f;
 		if (hadHitThisFrame) {
 			s_secondsSinceHit = 0.0f;
 		} else {
@@ -445,15 +304,9 @@ namespace Hooks
 		OcclusionStripper::SetStripped(s_secondsSinceHit < Settings::StripLingerSeconds);
 	}
 
-	//I know RawNode and RawList are bad. but I'm pretty sure that the interface in commonlib is wrong.
-	//The 3rd member is supposed to be a pointer to an occlusionshape, not a stack allocated one. And
-	// the fact that this shit works is representative of this.
 	namespace
 	{
-		// Mirrors the runtime layout of NiTPointerList<BSOcclusionShape*> — a
-		// next/prev/data triple per node, with the list header carrying head/tail
-		// and the allocator's size field. We READ these in the collection step
-		// (no mutation), so the engine's own cleanup paths walk them unchanged.
+		// this is a grotesque reinterpret cast because the pointerlist in commonlib i dont think is correct
 		struct RawNode
 		{
 			RawNode*              next;
@@ -471,15 +324,8 @@ namespace Hooks
 		};
 		static_assert(sizeof(RawList) == 0x18);
 
-		// Lateral margin around the camera→player segment. Shapes whose AABB
-		// (inflated by this radius) is hit by the segment get added to the
-		// skip-set. Smaller = fewer shapes skipped = better perf in dense areas
-		// but more risk of see-through getting blocked by an off-axis occluder.
 		constexpr float kStripRadius = 512.f;
 
-		// Conservative world-space AABB for an occlusion shape. Plane is a flat
-		// box (z extent = 0). Rotation is folded in via |M|·e (tighter than a
-		// pure sphere, looser than a true OBB).
 		bool ShapeWorldAABB(const RE::BSOcclusionShape* a_shape, RE::NiPoint3& a_min, RE::NiPoint3& a_max)
 		{
 			if (!a_shape) {
@@ -506,7 +352,6 @@ namespace Hooks
 			return true;
 		}
 
-		// Standard slab segment-vs-AABB intersection.
 		bool SegmentIntersectsAABB(const RE::NiPoint3& a_A, const RE::NiPoint3& a_B,
 		                           const RE::NiPoint3& a_min, const RE::NiPoint3& a_max)
 		{
@@ -537,19 +382,6 @@ namespace Hooks
 			return true;
 		}
 
-		// ── Position-displace strip machinery ──────────────────────────────────
-		// Save each shape's original translation on first encounter, then write
-		// a far-away position so it occludes nothing visible. Restore writes the
-		// saved translation back. List structure stays untouched — the engine's
-		// extra-data cleanup during cell unload walks unmodified pointers.
-		// Keepalive holds the shape alive even if its graph drops before restore.
-		//
-		// Race note: shape->translation is a 12-byte NiPoint3 written here without
-		// locking. If the engine reads positions concurrently from another thread
-		// during our write, the read could tear (mix of old + new components). We
-		// accept this — worst case is one frame of partial-displaced positions,
-		// which manifests as imperceptible flicker. The displace/restore both run
-		// from SetStripped, called only from Update, which we assume is serial.
 		struct PositionSnapshot
 		{
 			RE::NiPointer<RE::BSOcclusionShape> keepalive;
@@ -568,9 +400,6 @@ namespace Hooks
 			return s_stripped;
 		}
 
-		// "Out of frustum / nowhere near anything" — large but finite so we don't
-		// trip any NaN/Inf guards in engine code. Anything beyond ~1e7 is well
-		// outside any worldspace cell coordinate the engine ever uses.
 		constexpr RE::NiPoint3 kFarawayPosition{ 1.0e8f, 1.0e8f, 1.0e8f };
 
 		void DisplaceList(RawList* a_list,
@@ -587,7 +416,7 @@ namespace Hooks
 					continue;
 				}
 				if (map.contains(shape)) {
-					continue;  // already displaced this frame; don't re-snapshot the displaced position
+					continue;
 				}
 				RE::NiPoint3 mn, mx;
 				if (!ShapeWorldAABB(shape, mn, mx)) {
@@ -619,51 +448,26 @@ namespace Hooks
 	}
 
 
-	// Hook BSMultiBoundRoom::QPointWithin (vfunc 0x3F). The engine calls it to test
-	// whether a point lies inside a room — drives both camera-room association
-	// (which seeds the portal-graph visibility walk) and object-room association.
-	//
-	// While see-through is engaged AND the player is in some interior with a portal
-	// graph, we return true for every room in that cell's graph. The engine
-	// accumulates visibility across every room that returns true, so the entire
-	// cell renders regardless of where the camera floats. Outside see-through
-	// (clipDistance == 0) we don't override anything, so default play is untouched.
 	struct HookQPointWithin
 	{
 		static bool thunk(RE::BSMultiBoundNode* a_this, RE::NiPoint3& a_point)
 		{
-			const bool seeThroughActive = g_clipDistance.load(std::memory_order_acquire) > 0.0f;
-			const bool havePlayerRoom   = g_playerRoom.load(std::memory_order_acquire) != nullptr;
-			if (seeThroughActive && havePlayerRoom) {
-				auto       rec  = g_forceVisRecord.load(std::memory_order_acquire);
-				auto*      self = static_cast<RE::BSMultiBoundRoom*>(a_this);
-				if (rec && rec->rooms.count(self) > 0) {
-					return true;
-				}
+			// obviously dangerous
+			const bool result = func(a_this, a_point);
+			if (g_clipDistance.load(std::memory_order_acquire) > 0.0f) {
+				return true;
 			}
-			return func(a_this, a_point);
+			return result;
 		}
 		static inline REL::Relocation<decltype(thunk)> func;
 
 		static void Install()
 		{
-			if (!kInstallQPoint) {
-				logs::info("[install] BSMultiBoundRoom::QPointWithin hook SKIPPED (kInstallQPoint=false)");
-				return;
-			}
 			REL::Relocation<std::uintptr_t> vtbl{ RE::VTABLE_BSMultiBoundRoom[0] };
 			func = vtbl.write_vfunc(0x3F, thunk);
 			logs::info("[install] BSMultiBoundRoom::QPointWithin hook installed at vtbl[0x3F]");
 		}
 	};
-
-	namespace
-	{
-		bool CallOrigQPointWithin(RE::BSMultiBoundRoom* a_room, RE::NiPoint3& a_point)
-		{
-			return HookQPointWithin::func(a_room, a_point);
-		}
-	}
 
 	OcclusionStripper* OcclusionStripper::GetSingleton()
 	{
@@ -671,84 +475,38 @@ namespace Hooks
 		return &inst;
 	}
 
-	void OcclusionStripper::StripGraph(RE::BSPortalGraph* a_graph)
+	namespace
 	{
-		// Outdoors: position-displace shapes inside the camera→player capsule so they
-		// stop occluding visible geometry. The graph's list structure is read but never
-		// mutated, so the engine's extra-data cleanup during cell unload walks
-		// unmodified pointers — no race, no crash.
-		//
-		// Indoors: publish (graph + rooms + bounds) into g_forceVisRecord so the
-		// QPointWithin thunk can redirect camera-position queries to the player's
-		// room. Separate mechanism from the displace strip.
-		if (!a_graph) {
-			return;
-		}
-		auto* pc = RE::PlayerCharacter::GetSingleton();
-		if (!pc) {
-			return;
-		}
-		auto* cam = RE::PlayerCamera::GetSingleton();
-		const RE::NiPoint3 segB = pc->GetPosition();
-		const RE::NiPoint3 segA = cam ? cam->GetRuntimeData2().pos : segB;
-		const bool         isInterior = pc->GetParentCell() && pc->GetParentCell()->IsInteriorCell();
+		void DisplaceForFrame()
+		{
+			auto* pc = RE::PlayerCharacter::GetSingleton();
+			if (!pc) {
+				return;
+			}
+			auto* cam = RE::PlayerCamera::GetSingleton();
+			const RE::NiPoint3 segB = pc->GetPosition();
+			const RE::NiPoint3 segA = cam ? cam->GetRuntimeData2().pos : segB;
 
-		// Outdoor only: position-displace strip. Write each in-capsule shape's
-		// translation far away so it stops occluding visible geometry. List
-		// structure unchanged → cell-unload extra-data cleanup is unaffected.
-		if (!isInterior) {
-			// reinterpret_cast hell
-			DisplaceList(reinterpret_cast<RawList*>(&a_graph->occlusionShapes),
-			             segA, segB, kStripRadius);
-		}
-
-		if (isInterior && kPublishIndoor) {
-			auto rec            = std::make_shared<ForceVisRecord>();
-			rec->graphKeepalive = RE::NiPointer<RE::BSPortalGraph>(a_graph);
-			for (auto& roomPtr : a_graph->rooms) {
-				if (auto* room = roomPtr.get()) {
-					rec->rooms.insert(room);
+			auto* cell = pc->GetParentCell();
+			if (cell && !cell->IsInteriorCell()) {
+				if (auto* loaded = cell->GetRuntimeData().loadedData) {
+					if (auto* g = loaded->portalGraph.get()) {
+						DisplaceList(reinterpret_cast<RawList*>(&g->occlusionShapes),
+						             segA, segB, kStripRadius);
+					}
 				}
 			}
-			g_forceVisRecord.store(std::shared_ptr<const ForceVisRecord>(std::move(rec)),
-			                       std::memory_order_release);
-		}
-	}
-
-	void OcclusionStripper::StripCell(RE::TESObjectCELL* a_cell)
-	{
-		if (!a_cell) {
-			return;
-		}
-		auto& data = a_cell->GetRuntimeData();
-		if (auto* loaded = data.loadedData) {
-			if (auto* graph = loaded->portalGraph.get()) {
-				StripGraph(graph);
+			if (auto* ws = pc->GetWorldspace()) {
+				if (auto* g = ws->portalGraph.get()) {
+					DisplaceList(reinterpret_cast<RawList*>(&g->occlusionShapes),
+					             segA, segB, kStripRadius);
+				}
 			}
 		}
-	}
-
-	void OcclusionStripper::RestoreAll()
-	{
-		// Position-displace restore: write each saved translation back.
-		RestoreAllPositions();
-	}
-
-	bool OcclusionStripper::IsStripped()
-	{
-		return StrippedFlag();
 	}
 
 	void OcclusionStripper::SetStripped(bool a_stripped)
 	{
-		if (!kEnableStripper) {
-			return;
-		}
-		// Position-displace lifecycle: displace once on toggle-on, refresh every
-		// 0.25s while active so shapes that come into the capsule as the player
-		// moves get caught. Restore-then-displace keeps the saved-position map
-		// in sync (re-displacing without restoring would snapshot a displaced
-		// position as the "saved" value, then restore-to-far-away forever).
 		constexpr float kRefreshInterval = 0.25f;
 		static float*   g_DeltaTime      = (float*)RELOCATION_ID(523661, 410200).address();
 		static float    s_secondsSinceRefresh = 0.0f;
@@ -758,35 +516,19 @@ namespace Hooks
 				s_secondsSinceRefresh += *g_DeltaTime;
 				if (s_secondsSinceRefresh >= kRefreshInterval) {
 					RestoreAllPositions();
-					StripAll();
+					DisplaceForFrame();
 					s_secondsSinceRefresh = 0.0f;
 				}
 			}
 			return;
 		}
 		if (a_stripped) {
-			StripAll();
+			DisplaceForFrame();
 			StrippedFlag() = true;
 			s_secondsSinceRefresh = 0.0f;
 		} else {
-			RestoreAll();
+			RestoreAllPositions();
 			StrippedFlag() = false;
-		}
-	}
-
-	void OcclusionStripper::StripAll()
-	{
-		auto* pc = RE::PlayerCharacter::GetSingleton();
-		if (!pc) {
-			return;
-		}
-		if (auto* cell = pc->GetParentCell()) {
-			StripCell(cell);
-		}
-		if (auto* ws = pc->GetWorldspace()) {
-			if (auto* graph = ws->portalGraph.get()) {
-				StripGraph(graph);
-			}
 		}
 	}
 
@@ -794,15 +536,9 @@ namespace Hooks
 		const RE::TESCellFullyLoadedEvent*,
 		RE::BSTEventSource<RE::TESCellFullyLoadedEvent>*)
 	{
-		// On any cell-load: restore positions if currently stripped, then re-strip
-		// so the new cell's shapes get picked up and stale entries are dropped.
-		// Position-displace doesn't crash on cell transition because list
-		// structure is untouched, so we don't need this to fire pre-transition.
 		if (StrippedFlag()) {
 			RestoreAllPositions();
-			StrippedFlag() = false;
-			StripAll();
-			StrippedFlag() = true;
+			DisplaceForFrame();
 		}
 		return RE::BSEventNotifyControl::kContinue;
 	}
@@ -811,7 +547,6 @@ namespace Hooks
 		const RE::TESLoadGameEvent*,
 		RE::BSTEventSource<RE::TESLoadGameEvent>*)
 	{
-		g_forceVisRecord.store(nullptr, std::memory_order_release);
 		g_publishedHits.store(nullptr, std::memory_order_release);
 		g_clipDistance.store(0.0f, std::memory_order_release);
 		RestoreAllPositions();
@@ -821,10 +556,6 @@ namespace Hooks
 
 	void OcclusionStripper::Install()
 	{
-		if (!kEnableStripper) {
-			logs::info("occlusion stripper DISABLED (kEnableStripper=false)");
-			return;
-		}
 		if (auto* src = RE::ScriptEventSourceHolder::GetSingleton()) {
 			src->AddEventSink<RE::TESCellFullyLoadedEvent>(GetSingleton());
 			src->AddEventSink<RE::TESLoadGameEvent>(GetSingleton());

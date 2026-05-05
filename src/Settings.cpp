@@ -9,7 +9,6 @@
 
 namespace
 {
-	// Resolved relative to Skyrim's install root (SKSE's CWD when loaded).
 	constexpr const char* kIniPath = "Data\\SKSE\\Plugins\\skyrimcameradisocclusion.ini";
 
 	std::string Trim(std::string a_s)
@@ -20,10 +19,6 @@ namespace
 		return a_s;
 	}
 
-	// Parse the INI into a flat "Section.Key" → value-string map. Comments
-	// (lines starting with ';' or '#'), blank lines, and lines without an '='
-	// are skipped. Section header form is `[Name]`. Whitespace around section
-	// names, keys, and values is trimmed.
 	std::unordered_map<std::string, std::string> ParseIni(const char* a_path)
 	{
 		std::unordered_map<std::string, std::string> out;
@@ -51,9 +46,6 @@ namespace
 		return out;
 	}
 
-	// Look up a "Section.Key" entry as a float. Falls back to a_default if the
-	// key is missing or unparseable; clamps the result to [a_min, a_max] so a
-	// hand-edited "999999" or negative value can't break the simulation.
 	float Lookup(const std::unordered_map<std::string, std::string>& a_map,
 	             const std::string& a_sectionDotKey,
 	             float a_default, float a_min, float a_max)
@@ -65,7 +57,7 @@ namespace
 		char* end = nullptr;
 		const float v = std::strtof(it->second.c_str(), &end);
 		if (end == it->second.c_str()) {
-			return a_default;  // unparseable
+			return a_default;
 		}
 		return std::clamp(v, a_min, a_max);
 	}

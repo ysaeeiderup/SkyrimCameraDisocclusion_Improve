@@ -54,17 +54,9 @@ namespace Hooks
 			const RE::TESLoadGameEvent*                a_event,
 			RE::BSTEventSource<RE::TESLoadGameEvent>*) override;
 
-		static void StripCell(RE::TESObjectCELL* a_cell);
-		static void StripGraph(RE::BSPortalGraph* a_graph);
-		static void StripAll();
-		static void RestoreAll();
 		static void SetStripped(bool a_stripped);
-		static bool IsStripped();
 	};
 
 	void Install();
-
-	// Called from the SKSE messaging listener on kDataLoaded — by then the
-	// renderer is alive and we can patch the D3D11 device-context vtable.
 	void OnDataLoaded();
 }
