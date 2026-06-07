@@ -1,0 +1,9 @@
+{
+    "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+    "name": "skyrim-camera-disocclusion-improve",
+    "version-string": "0.1.0",
+    "dependencies": [
+        "rsm-binary-io",
+        "commonlibsse-ng"
+    ]
+}

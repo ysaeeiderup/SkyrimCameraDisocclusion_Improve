@@ -1,8 +1,19 @@
 #pragma once
 
+#include <cstddef>
+
 
 namespace Hooks
 {
+	constexpr std::ptrdiff_t RelocateSEAE(std::ptrdiff_t a_se, std::ptrdiff_t a_ae)
+	{
+#ifdef SKYRIM_SUPPORT_AE
+		return a_ae;
+#else
+		return a_se;
+#endif
+	}
+
 	class HookPlayerCharacter
 	{
 	public:
@@ -31,7 +42,7 @@ namespace Hooks
 		{
 			auto& trampoline = SKSE::GetTrampoline();
 			BSBatchRenderer_RenderPassImmediately::func = trampoline.write_call<5>(
-				REL::RelocationID(100852, 107642).address() + REL::Relocate(0x29E, 0x28F),
+				RELOCATION_ID(100852, 107642).address() + RelocateSEAE(0x29E, 0x28F),
 				reinterpret_cast<uintptr_t>(BSBatchRenderer_RenderPassImmediately::thunk)
 				);
 			logs::info("hook renderpassimmediately");
@@ -54,9 +65,17 @@ namespace Hooks
 			const RE::TESLoadGameEvent*                a_event,
 			RE::BSTEventSource<RE::TESLoadGameEvent>*) override;
 
+		static void StripCell(RE::TESObjectCELL* a_cell);
+		static void StripGraph(RE::BSPortalGraph* a_graph);
+		static void StripAll();
+		static void RestoreAll();
 		static void SetStripped(bool a_stripped);
+		static bool IsStripped();
 	};
 
 	void Install();
+
+	// Called from the SKSE messaging listener on kDataLoaded ??by then the
+	// renderer is alive and we can patch the D3D11 device-context vtable.
 	void OnDataLoaded();
 }

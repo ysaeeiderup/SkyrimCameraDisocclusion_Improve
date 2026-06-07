@@ -1,51 +1,49 @@
-# CommonLibSSE-NG Plugin Template
+# SkyrimCameraDisocclusion_Improve
 
-This is a basic plugin template using CommonLibSSE-NG.
+This repository contains a Skyrim SE SKSE plugin focused on third-person camera disocclusion (see-through behavior when the camera is blocked).
 
-### Requirements
-* [XMake](https://xmake.io) [3.0.0+]
-* C++23 Compiler (MSVC, Clang-CL)
+The project now supports a CMake + VS2022 workflow that is reproducible in VS Code while preserving the original source intent.
 
-## Getting Started
-```bat
-git clone --recurse-submodules https://github.com/libxse/commonlibsse-ng-template
-cd commonlibsse-ng-template
+## Requirements
+
+- Visual Studio 2022 with Desktop development with C++
+- CMake 3.21+
+- `VCPKG_ROOT` pointing to your local vcpkg checkout
+- Local registries used by this workspace:
+  - `C:/SKSE_Development/registries/vcpkg`
+  - `C:/SKSE_Development/registries/vcpkg-colorglass`
+
+## Build
+
+Debug:
+
+```powershell
+cmake --preset debug
+cmake --build --preset build-debug
 ```
 
-### Build
-To build the project, run the following command:
-```bat
-xmake build
+Release:
+
+```powershell
+cmake --preset release
+cmake --build --preset build-release
 ```
 
-> ***Note:*** *This will generate a `build/windows/` directory in the **project's root directory** with the build output.*
+## Current Build Route
 
+- Default route builds against local `../CommonLibSSE` when available.
+- Fallback route uses package-managed `CommonLibSSE` (`find_package`).
+- This is controlled by `USE_LOCAL_COMMONLIBSSE` in `CMakeLists.txt`.
 
-### Build Output (Optional)
-If you want to redirect the build output, set one of the following environment variables:
+## Output
 
-- Path to a Mod Manager mods folder: `XSE_TES5_MODS_PATH`
+- Debug DLL: `build/vs-debug/Debug/skyrimcameradisocclusion.dll`
+- Release DLL: `build/vs-release/Release/skyrimcameradisocclusion.dll`
 
-  or
+If `SKYRIM_MODS_FOLDER` or `SKYRIM_FOLDER` is set, post-build copy places the plugin into `SKSE/Plugins` automatically.
 
-- Path to a Skyrim install folder: `XSE_TES5_GAME_PATH`
+## Notes
 
-**Alternatively**, use the [set_installdir](https://xmake.io/api/description/project-target.html#set-installdir) api to set a specific install path instead, either globally or per target. By default, your plugin `.dll` and `.pdb` are included, but you can *add* more files to be installed by using the [add_installfiles](https://xmake.io/api/description/project-target.html#add-installfiles) api.
-
-### Project Generation (Optional)
-If you use Visual Studio, run the following command:
-```bat
-xmake project -k vsxmake
-```
-
-> ***Note:*** *This will generate a `vsxmakeXXXX/` directory in the **project's root directory** using the latest version of Visual Studio installed on the system.*
-
-**Alternatively**, if you do not use Visual Studio, you can generate a `compile_commands.json` file for use with a laguage server like clangd in any code editor that supports it, like vscode:
-```bat
-xmake project -k compile_commands
-```
-
-> ***Note:*** *You must have a language server extension installed to make use of this file. I recommend `clangd`. Do not have more than one installed at a time as they will conflict with each other. I also recommend installing the `xmake` extension if available to make building the project easier.*
-
-## Documentation
-Please refer to the [Wiki](../../wiki/Home) for more advanced topics.
+- SKSE menu integration code is intentionally not part of the current patch.
+- Renderer clipping logic is restored on the current CommonLibSSE route through compatibility accessors in `src/Hook.cpp`.
+- `xmake.lua` remains in the repository, but CMake presets are the validated workflow for this branch.
