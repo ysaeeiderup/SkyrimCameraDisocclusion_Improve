@@ -188,6 +188,9 @@ namespace Settings
 		HitLingerSeconds   = Lookup(ini, "Strip.HitLingerSeconds",      2.0f,    0.0f,   30.0f);
 		ModEnabled.store(LookupBool(ini, "General.bEnable", true), std::memory_order_release);
 		DumpLogEnabled.store(LookupBool(ini, "General.bDumpLog", true), std::memory_order_release);
+		UseWeaponDrawCondition.store(LookupBool(ini, "General.bUseWeaponDrawCondition", false), std::memory_order_release);
+		UseCombatCondition.store(LookupBool(ini, "General.bUseCombatCondition", false), std::memory_order_release);
+		UseTargetLockCondition.store(LookupBool(ini, "General.bUseTargetLockCondition", false), std::memory_order_release);
 		EnabledCameraLayerSpec = LookupString(ini, "General.EnabledCameraLayerSpec", "skyrim camera disocclusion.esp|800");
 		DisabledCameraLayerSpec = LookupString(ini, "General.DisabledCameraLayerSpec", "Skyrim.esm|088788");
 
@@ -195,8 +198,8 @@ namespace Settings
 			ResetDumpLogForSession();
 		}
 
-		logs::info("settings: enabled={} dumpLog={} heightOffset={:.1f} fan=({:.1f},{:.1f}) lingers=(strip={:.2f}, hit={:.2f})",
-			IsModEnabled(), IsDumpLogEnabled(),
+		logs::info("settings: enabled={} dumpLog={} conds=(weapon={},combat={},targetLock={}) heightOffset={:.1f} fan=({:.1f},{:.1f}) lingers=(strip={:.2f}, hit={:.2f})",
+			IsModEnabled(), IsDumpLogEnabled(), IsUseWeaponDrawCondition(), IsUseCombatCondition(), IsUseTargetLockCondition(),
 			PlayerHeightOffset, FanRadiusH, FanRadiusV,
 			StripLingerSeconds, HitLingerSeconds);
 		logs::info("settings: layerSpec enabled='{}' disabled='{}'", EnabledCameraLayerSpec, DisabledCameraLayerSpec);
@@ -208,6 +211,9 @@ namespace Settings
 	{
 		SaveBool("General", "bEnable", IsModEnabled());
 		SaveBool("General", "bDumpLog", IsDumpLogEnabled());
+		SaveBool("General", "bUseWeaponDrawCondition", IsUseWeaponDrawCondition());
+		SaveBool("General", "bUseCombatCondition", IsUseCombatCondition());
+		SaveBool("General", "bUseTargetLockCondition", IsUseTargetLockCondition());
 		SaveString("General", "EnabledCameraLayerSpec", EnabledCameraLayerSpec);
 		SaveString("General", "DisabledCameraLayerSpec", DisabledCameraLayerSpec);
 
@@ -230,6 +236,21 @@ namespace Settings
 		return DumpLogEnabled.load(std::memory_order_acquire);
 	}
 
+	bool IsUseWeaponDrawCondition()
+	{
+		return UseWeaponDrawCondition.load(std::memory_order_acquire);
+	}
+
+	bool IsUseCombatCondition()
+	{
+		return UseCombatCondition.load(std::memory_order_acquire);
+	}
+
+	bool IsUseTargetLockCondition()
+	{
+		return UseTargetLockCondition.load(std::memory_order_acquire);
+	}
+
 	void SetModEnabled(bool a_enabled)
 	{
 		ModEnabled.store(a_enabled, std::memory_order_release);
@@ -243,6 +264,24 @@ namespace Settings
 			ResetDumpLogForSession();
 		}
 		LogEvent(a_enabled ? "[toggle] dump log enabled" : "[toggle] dump log disabled", true);
+	}
+
+	void SetUseWeaponDrawCondition(bool a_enabled)
+	{
+		UseWeaponDrawCondition.store(a_enabled, std::memory_order_release);
+		LogEvent(a_enabled ? "[toggle] weapon-draw condition enabled" : "[toggle] weapon-draw condition disabled", true);
+	}
+
+	void SetUseCombatCondition(bool a_enabled)
+	{
+		UseCombatCondition.store(a_enabled, std::memory_order_release);
+		LogEvent(a_enabled ? "[toggle] combat condition enabled" : "[toggle] combat condition disabled", true);
+	}
+
+	void SetUseTargetLockCondition(bool a_enabled)
+	{
+		UseTargetLockCondition.store(a_enabled, std::memory_order_release);
+		LogEvent(a_enabled ? "[toggle] target-lock condition enabled" : "[toggle] target-lock condition disabled", true);
 	}
 
 	void LogEvent(const std::string& a_message, bool a_forceDump)

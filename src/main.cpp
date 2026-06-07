@@ -33,7 +33,7 @@ namespace
 		void __stdcall RenderGeneral()
 		{
 			ImGui::Text("Skyrim Camera Disocclusion");
-			ImGui::Text("General toggles and camera tuning");
+			ImGui::Text("General toggles and camera profile conditions");
 
 			bool modEnabled = Settings::IsModEnabled();
 			if (ImGui::Checkbox("Enable disocclusion feature", &modEnabled)) {
@@ -45,6 +45,30 @@ namespace
 			bool dumpLogEnabled = Settings::IsDumpLogEnabled();
 			if (ImGui::Checkbox("Enable local dump log", &dumpLogEnabled)) {
 				Settings::SetDumpLogEnabled(dumpLogEnabled);
+				Settings::Save();
+			}
+
+			ImGui::Separator();
+			ImGui::Text("Enabled profile conditions (AND when multiple are on)");
+
+			bool useWeaponDrawCondition = Settings::IsUseWeaponDrawCondition();
+			if (ImGui::Checkbox("Use weapon-drawn condition", &useWeaponDrawCondition)) {
+				Settings::SetUseWeaponDrawCondition(useWeaponDrawCondition);
+				Hooks::OnFeatureToggleChanged(Settings::IsModEnabled());
+				Settings::Save();
+			}
+
+			bool useCombatCondition = Settings::IsUseCombatCondition();
+			if (ImGui::Checkbox("Use in-combat condition", &useCombatCondition)) {
+				Settings::SetUseCombatCondition(useCombatCondition);
+				Hooks::OnFeatureToggleChanged(Settings::IsModEnabled());
+				Settings::Save();
+			}
+
+			bool useTargetLockCondition = Settings::IsUseTargetLockCondition();
+			if (ImGui::Checkbox("Use target-lock condition (TDM)", &useTargetLockCondition)) {
+				Settings::SetUseTargetLockCondition(useTargetLockCondition);
+				Hooks::OnFeatureToggleChanged(Settings::IsModEnabled());
 				Settings::Save();
 			}
 

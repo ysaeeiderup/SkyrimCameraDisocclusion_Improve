@@ -44,6 +44,12 @@ If `SKYRIM_MODS_FOLDER` or `SKYRIM_FOLDER` is set, post-build copy places the pl
 
 ## Notes
 
-- SKSE menu integration code is intentionally not part of the current patch.
+- SKSE menu integration is enabled in this branch (when SKSE Menu Framework runtime is present).
 - Renderer clipping logic is restored on the current CommonLibSSE route through compatibility accessors in `src/Hook.cpp`.
 - `xmake.lua` remains in the repository, but CMake presets are the validated workflow for this branch.
+
+## Upstream Review Guide
+
+For submitting these additions back to upstream authors, see:
+
+- `UPSTREAM_PATCH_REVIEW.md`

@@ -25,6 +25,7 @@
 #include "RE/S/Sky.h"
 #include "RE/T/TESDataHandler.h"
 #include "RE/T/TESFile.h"
+#include "RE/A/ActorState.h"
 #include "Settings.h"
 #include <atomic>
 #include <memory>
@@ -113,9 +114,260 @@ namespace Hooks
 	// The toggle now switches these profiles; core disocclusion logic stays active.
 	static std::atomic<std::uint64_t> g_enabledCameraLayerMask{ 0 };
 	static std::atomic<std::uint64_t> g_disabledCameraLayerMask{ 0 };
+	static std::atomic<bool> g_useEnabledCameraProfile{ false };
+	static std::atomic<std::uint32_t> g_updateThreadId{ 0 };
+	static std::atomic<bool> g_hasDeferredProfileApply{ false };
+	static std::atomic<bool> g_deferredUseEnabledProfile{ false };
+	static std::atomic<bool> g_deferredForceApply{ false };
+	// Debounce profile oscillation around condition boundaries (weapon/combat/lock transitions).
+	// Trade-off: a profile flip can be delayed by up to this window to reduce rapid back-and-forth applies.
+	constexpr std::uint32_t kProfileSwitchDebounceMs = 150;
+	static std::atomic<bool> g_debounceTargetUseEnabledProfile{ false };
+	static std::atomic<std::uint32_t> g_debounceTargetSinceTick{ 0 };
+	static std::atomic<bool> g_debounceActive{ false };
 
 	namespace
 	{
+		void ApplyCameraCollisionLayer(RE::COL_LAYER a_layer, std::uint64_t a_mask, const char* a_reason);
+
+		std::uint32_t GetNowTickMs()
+		{
+			return static_cast<std::uint32_t>(::GetTickCount64() & 0xFFFFFFFFULL);
+		}
+
+		bool HasElapsedMs(std::uint32_t a_startTick, std::uint32_t a_intervalMs)
+		{
+			const std::uint32_t now = GetNowTickMs();
+			return static_cast<std::uint32_t>(now - a_startTick) >= a_intervalMs;
+		}
+
+		void BeginProfileDebounce(bool a_targetUseEnabledProfile, const char* a_reason)
+		{
+			g_debounceTargetUseEnabledProfile.store(a_targetUseEnabledProfile, std::memory_order_release);
+			g_debounceTargetSinceTick.store(GetNowTickMs(), std::memory_order_release);
+			g_debounceActive.store(true, std::memory_order_release);
+			Settings::LogEvent(std::string("[debounce] start (") + a_reason + ") target=" +
+				(a_targetUseEnabledProfile ? "enabled" : "disabled") +
+				" windowMs=" + std::to_string(kProfileSwitchDebounceMs), true);
+		}
+
+		bool ShouldApplyProfileWithDebounce(bool a_desiredUseEnabledProfile, bool a_forceApply, const char* a_reason)
+		{
+			if (a_forceApply) {
+				// Explicit operations (menu toggles, startup sync) should feel immediate and deterministic.
+				// We bypass debounce here so user intent is applied right away.
+				g_debounceActive.store(false, std::memory_order_release);
+				return true;
+			}
+
+			const bool currentUseEnabledProfile = g_useEnabledCameraProfile.load(std::memory_order_acquire);
+			if (a_desiredUseEnabledProfile == currentUseEnabledProfile) {
+				g_debounceActive.store(false, std::memory_order_release);
+				return false;
+			}
+
+			const bool debounceActive = g_debounceActive.load(std::memory_order_acquire);
+			if (!debounceActive) {
+				BeginProfileDebounce(a_desiredUseEnabledProfile, a_reason);
+				return false;
+			}
+
+			const bool pendingTarget = g_debounceTargetUseEnabledProfile.load(std::memory_order_acquire);
+			if (pendingTarget != a_desiredUseEnabledProfile) {
+				// Direction changed during debounce window; restart the timer for the new target.
+				BeginProfileDebounce(a_desiredUseEnabledProfile, a_reason);
+				return false;
+			}
+
+			const std::uint32_t sinceTick = g_debounceTargetSinceTick.load(std::memory_order_acquire);
+			if (!HasElapsedMs(sinceTick, kProfileSwitchDebounceMs)) {
+				return false;
+			}
+
+			g_debounceActive.store(false, std::memory_order_release);
+			Settings::LogEvent(std::string("[debounce] commit (") + a_reason + ") target=" +
+				(a_desiredUseEnabledProfile ? "enabled" : "disabled"), true);
+			return true;
+		}
+
+		void MarkCurrentThreadAsUpdateThread()
+		{
+			const auto tid = static_cast<std::uint32_t>(::GetCurrentThreadId());
+			std::uint32_t expected = 0;
+			if (g_updateThreadId.compare_exchange_strong(expected, tid, std::memory_order_acq_rel)) {
+				Settings::LogEvent("[thread] update thread captured: tid=" + std::to_string(tid), true);
+			}
+		}
+
+		bool IsUpdateThread()
+		{
+			const auto updateTid = g_updateThreadId.load(std::memory_order_acquire);
+			if (updateTid == 0) {
+				return false;
+			}
+			const auto currentTid = static_cast<std::uint32_t>(::GetCurrentThreadId());
+			return updateTid == currentTid;
+		}
+
+		struct ConditionState
+		{
+			bool masterEnabled{ false };
+			bool useWeaponCondition{ false };
+			bool useCombatCondition{ false };
+			bool useTargetLockCondition{ false };
+			bool weaponDrawn{ false };
+			bool inCombat{ false };
+			bool targetLocked{ false };
+			bool selectedEnabledProfile{ false };
+		};
+
+		bool operator==(const ConditionState& a_lhs, const ConditionState& a_rhs)
+		{
+			return a_lhs.masterEnabled == a_rhs.masterEnabled &&
+			       a_lhs.useWeaponCondition == a_rhs.useWeaponCondition &&
+			       a_lhs.useCombatCondition == a_rhs.useCombatCondition &&
+			       a_lhs.useTargetLockCondition == a_rhs.useTargetLockCondition &&
+			       a_lhs.weaponDrawn == a_rhs.weaponDrawn &&
+			       a_lhs.inCombat == a_rhs.inCombat &&
+			       a_lhs.targetLocked == a_rhs.targetLocked &&
+			       a_lhs.selectedEnabledProfile == a_rhs.selectedEnabledProfile;
+		}
+
+		bool operator!=(const ConditionState& a_lhs, const ConditionState& a_rhs)
+		{
+			return !(a_lhs == a_rhs);
+		}
+
+		void LogConditionState(const ConditionState& a_state, const char* a_reason)
+		{
+			Settings::LogEvent(std::string("[condition] ") + a_reason +
+				" master=" + (a_state.masterEnabled ? "1" : "0") +
+				" toggles(wpn=" + (a_state.useWeaponCondition ? "1" : "0") +
+				",combat=" + (a_state.useCombatCondition ? "1" : "0") +
+				",lock=" + (a_state.useTargetLockCondition ? "1" : "0") +
+				") states(wpn=" + (a_state.weaponDrawn ? "1" : "0") +
+				",combat=" + (a_state.inCombat ? "1" : "0") +
+				",lock=" + (a_state.targetLocked ? "1" : "0") +
+				") profile=" + (a_state.selectedEnabledProfile ? "enabled" : "disabled"),
+				true);
+		}
+
+		bool QueryTargetLockState(RE::Actor* a_player)
+		{
+			// Use graph variable only. Calling TDM API during startup can crash in some load orders.
+			// TDM updates this variable on the player animation graph while lock-on is active.
+			static bool s_loggedMissingGraphVar = false;
+			bool graphVarLocked = false;
+			if (a_player && a_player->GetGraphVariableBool("TDM_TargetLock", graphVarLocked)) {
+				return graphVarLocked;
+			}
+			if (!s_loggedMissingGraphVar) {
+				Settings::LogEvent("[condition] TDM target-lock graph var unavailable, defaulting to unlocked", true);
+				s_loggedMissingGraphVar = true;
+			}
+			return false;
+		}
+
+		ConditionState EvaluateConditions(RE::Actor* a_player)
+		{
+			ConditionState state;
+			state.masterEnabled = Settings::IsModEnabled();
+			state.useWeaponCondition = Settings::IsUseWeaponDrawCondition();
+			state.useCombatCondition = Settings::IsUseCombatCondition();
+			state.useTargetLockCondition = Settings::IsUseTargetLockCondition();
+
+			if (a_player) {
+				state.weaponDrawn = a_player->IsWeaponDrawn();
+				state.inCombat = a_player->IsInCombat();
+				state.targetLocked = QueryTargetLockState(a_player);
+			}
+
+			// Master OFF is an explicit fallback mode for compatibility:
+			// always pick Disabled profile (typically Skyrim.esm|088788).
+			if (!state.masterEnabled) {
+				state.selectedEnabledProfile = false;
+				return state;
+			}
+
+			int enabledConditionCount = 0;
+			bool passAllEnabledConditions = true;
+			if (state.useWeaponCondition) {
+				++enabledConditionCount;
+				passAllEnabledConditions = passAllEnabledConditions && state.weaponDrawn;
+			}
+			if (state.useCombatCondition) {
+				++enabledConditionCount;
+				passAllEnabledConditions = passAllEnabledConditions && state.inCombat;
+			}
+			if (state.useTargetLockCondition) {
+				++enabledConditionCount;
+				passAllEnabledConditions = passAllEnabledConditions && state.targetLocked;
+			}
+
+			// No condition enabled: keep legacy behavior of using Enabled profile when master is ON.
+			// Condition toggles are AND-combined: all enabled conditions must be true.
+			state.selectedEnabledProfile = enabledConditionCount == 0 ? true : passAllEnabledConditions;
+			return state;
+		}
+
+		void ApplySelectedProfile(bool a_useEnabledProfile, const char* a_reason)
+		{
+			// Profile switch writes both layer index and CNAM-equivalent runtime bitmask.
+			// This is required because Enabled/Disabled specs may share layerIdx but differ by mask.
+			const auto targetLayer = a_useEnabledProfile
+				? g_enabledCameraLayer.load(std::memory_order_acquire)
+				: g_disabledCameraLayer.load(std::memory_order_acquire);
+			const auto targetMask = a_useEnabledProfile
+				? g_enabledCameraLayerMask.load(std::memory_order_acquire)
+				: g_disabledCameraLayerMask.load(std::memory_order_acquire);
+			ApplyCameraCollisionLayer(targetLayer, targetMask, a_reason);
+			g_useEnabledCameraProfile.store(a_useEnabledProfile, std::memory_order_release);
+		}
+
+		void EvaluateAndApplyProfile(RE::Actor* a_player, const char* a_reason, bool a_forceApply)
+		{
+			static ConditionState s_lastLogged{};
+			static bool s_hasLoggedState = false;
+
+			const auto state = EvaluateConditions(a_player);
+			if (!s_hasLoggedState || state != s_lastLogged) {
+				LogConditionState(state, a_reason);
+				s_lastLogged = state;
+				s_hasLoggedState = true;
+			}
+
+			if (ShouldApplyProfileWithDebounce(state.selectedEnabledProfile, a_forceApply, a_reason)) {
+				if (!IsUpdateThread()) {
+					// Camera/Havok writes are deferred to update thread for safety.
+					// Non-update threads only publish desired state atomically.
+					g_deferredUseEnabledProfile.store(state.selectedEnabledProfile, std::memory_order_release);
+					g_deferredForceApply.store(a_forceApply, std::memory_order_release);
+					g_hasDeferredProfileApply.store(true, std::memory_order_release);
+					Settings::LogEvent(std::string("[thread] deferred profile apply from non-update thread (") + a_reason + ")", true);
+					return;
+				}
+
+				ApplySelectedProfile(state.selectedEnabledProfile, a_reason);
+			}
+		}
+
+		void DrainDeferredProfileApply()
+		{
+			if (!g_hasDeferredProfileApply.exchange(false, std::memory_order_acq_rel)) {
+				return;
+			}
+
+			const bool useEnabledProfile = g_deferredUseEnabledProfile.load(std::memory_order_acquire);
+			const bool forceApply = g_deferredForceApply.exchange(false, std::memory_order_acq_rel);
+			const bool currentlyEnabled = g_useEnabledCameraProfile.load(std::memory_order_acquire);
+			if (forceApply || useEnabledProfile != currentlyEnabled) {
+				// Deferred commit executes on update thread.
+				ApplySelectedProfile(useEnabledProfile, "deferred-apply");
+			}
+
+			g_debounceActive.store(false, std::memory_order_release);
+		}
+
 		std::string Hex8(std::uint32_t a_value)
 		{
 			char buffer[16]{};
@@ -253,6 +505,12 @@ namespace Hooks
 		{
 			// Re-read INI specs and publish resolved profile data used by Update()
 			// and ApplyCameraCollisionLayer() when toggling in menu.
+			//
+			// Upstream workflow note:
+			// - Disabled profile can stay vanilla (e.g. Skyrim.esm|088788) unchanged.
+			// - Mod profile is expected to be a new BGSCollisionLayer from mod plugin
+			//   (e.g. skyrim camera disocclusion.esp|800).
+			// Runtime then switches between these two profiles by conditions.
 			RE::COL_LAYER enabledLayer = static_cast<RE::COL_LAYER>(kDefaultCameraLayerIndex);
 			RE::COL_LAYER disabledLayer = static_cast<RE::COL_LAYER>(kDefaultCameraLayerIndex);
 			std::uint32_t enabledResolvedForm = 0;
@@ -579,6 +837,11 @@ namespace Hooks
 			return;
 		}
 
+		MarkCurrentThreadAsUpdateThread();
+		DrainDeferredProfileApply();
+
+		EvaluateAndApplyProfile(a_this, "player-update", false);
+
 		auto camera = RE::PlayerCamera::GetSingleton();
 		if (!camera) {
 			return;
@@ -636,11 +899,10 @@ namespace Hooks
 		float scale = RE::bhkWorld::GetWorldScale();
 		RE::CFilter colFilter;
 		a_this->GetCollisionFilterInfo(colFilter);
-		const RE::COL_LAYER desiredLayer = Settings::IsModEnabled()
+		const RE::COL_LAYER desiredLayer = g_useEnabledCameraProfile.load(std::memory_order_acquire)
 			? g_enabledCameraLayer.load(std::memory_order_acquire)
 			: g_disabledCameraLayer.load(std::memory_order_acquire);
-		// Master toggle only selects which camera collision profile to cast with.
-		// All disocclusion hooks keep running regardless of this setting.
+		// Casting layer follows the currently selected runtime camera profile.
 		colFilter.SetCollisionLayer(desiredLayer);
 		// Age existing entries; new hits will reset to 0 below.
 		for (auto& [obj, entry] : g_hitObjects) {
@@ -1186,26 +1448,17 @@ namespace Hooks
 	{
 		InstallClearRTVHook();
 		RefreshConfiguredCameraLayers();
-		const auto targetLayer = Settings::IsModEnabled()
-			? g_enabledCameraLayer.load(std::memory_order_acquire)
-			: g_disabledCameraLayer.load(std::memory_order_acquire);
-		const auto targetMask = Settings::IsModEnabled()
-			? g_enabledCameraLayerMask.load(std::memory_order_acquire)
-			: g_disabledCameraLayerMask.load(std::memory_order_acquire);
-		ApplyCameraCollisionLayer(targetLayer, targetMask, "data-loaded");
+
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		EvaluateAndApplyProfile(player, "data-loaded", true);
 	}
 
 	void OnFeatureToggleChanged(bool a_enabled)
 	{
-		// Toggle now means profile selection only; do not pause/reset runtime hooks.
+		// Master toggle and condition toggles only affect profile selection.
 		RefreshConfiguredCameraLayers();
-		const auto targetLayer = a_enabled
-			? g_enabledCameraLayer.load(std::memory_order_acquire)
-			: g_disabledCameraLayer.load(std::memory_order_acquire);
-		const auto targetMask = a_enabled
-			? g_enabledCameraLayerMask.load(std::memory_order_acquire)
-			: g_disabledCameraLayerMask.load(std::memory_order_acquire);
-		ApplyCameraCollisionLayer(targetLayer, targetMask, a_enabled ? "toggle-enabled" : "toggle-disabled");
-		Settings::LogEvent(std::string("[runtime] camera profile selected: ") + (a_enabled ? "enabled" : "disabled"), true);
+
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		EvaluateAndApplyProfile(player, a_enabled ? "toggle-master-on" : "toggle-master-off", true);
 	}
 }
