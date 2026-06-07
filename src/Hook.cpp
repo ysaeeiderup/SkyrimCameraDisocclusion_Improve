@@ -3,9 +3,12 @@
 #include "RE/P/PlayerCamera.h"
 #include "RE/T/TESObjectCELL.h"
 #include "RE/B/bhkWorld.h"
+#include "RE/B/bhkRigidBody.h"
+#include "RE/B/bhkCollisionFilter.h"
 #include "RE/B/bhkPickData.h"
 #include "RE/H/hkpWorldRayCastInput.h"
 #include "RE/H/hkpWorldRayCastOutput.h"
+#include "RE/H/hkpRigidBody.h"
 #include "RE/T/TESHavokUtilities.h"
 #include "RE/T/TESObjectREFR.h"
 #include "RE/N/NiPoint3.h"
@@ -18,7 +21,10 @@
 #include "RE/B/BSMultiBoundRoom.h"
 #include "RE/B/BSOcclusionPlane.h"
 #include "RE/B/BSOcclusionBox.h"
+#include "RE/B/BGSCollisionLayer.h"
 #include "RE/S/Sky.h"
+#include "RE/T/TESDataHandler.h"
+#include "RE/T/TESFile.h"
 #include "Settings.h"
 #include <atomic>
 #include <memory>
@@ -100,6 +106,253 @@ namespace Hooks
 	// cell graph, making the engine's visibility walk seed from every room and the
 	// whole cell render regardless of where the camera floats.
 	static std::atomic<RE::BSMultiBoundRoom*> g_playerRoom{ nullptr };
+	constexpr std::uint32_t kDefaultCameraLayerIndex = 39;
+	static std::atomic<RE::COL_LAYER> g_enabledCameraLayer{ static_cast<RE::COL_LAYER>(kDefaultCameraLayerIndex) };
+	static std::atomic<RE::COL_LAYER> g_disabledCameraLayer{ static_cast<RE::COL_LAYER>(kDefaultCameraLayerIndex) };
+	// CNAM-equivalent runtime masks for the selected collision layer profile.
+	// The toggle now switches these profiles; core disocclusion logic stays active.
+	static std::atomic<std::uint64_t> g_enabledCameraLayerMask{ 0 };
+	static std::atomic<std::uint64_t> g_disabledCameraLayerMask{ 0 };
+
+	namespace
+	{
+		std::string Hex8(std::uint32_t a_value)
+		{
+			char buffer[16]{};
+			std::snprintf(buffer, sizeof(buffer), "%08X", a_value);
+			return buffer;
+		}
+
+		std::string Hex16(std::uint64_t a_value)
+		{
+			char buffer[24]{};
+			std::snprintf(buffer, sizeof(buffer), "%016llX", static_cast<unsigned long long>(a_value));
+			return buffer;
+		}
+
+		std::string TrimCopy(std::string a_s)
+		{
+			const auto notSpace = [](unsigned char c) { return std::isspace(c) == 0; };
+			a_s.erase(a_s.begin(), std::find_if(a_s.begin(), a_s.end(), notSpace));
+			a_s.erase(std::find_if(a_s.rbegin(), a_s.rend(), notSpace).base(), a_s.end());
+			return a_s;
+		}
+
+		bool TryParseHex(std::string a_text, std::uint32_t& a_out)
+		{
+			a_text = TrimCopy(std::move(a_text));
+			if (a_text.empty()) {
+				return false;
+			}
+			if (a_text.rfind("0x", 0) == 0 || a_text.rfind("0X", 0) == 0) {
+				a_text.erase(0, 2);
+			}
+			char* end = nullptr;
+			const unsigned long parsed = std::strtoul(a_text.c_str(), &end, 16);
+			if (end == a_text.c_str() || (end && *end != '\0') || parsed > 0xFFFFFFFFUL) {
+				return false;
+			}
+			a_out = static_cast<std::uint32_t>(parsed);
+			return true;
+		}
+
+		bool ResolveLayerSpec(const std::string& a_spec,
+		                      RE::COL_LAYER& a_outLayer,
+		                      std::uint32_t& a_outResolvedFormID,
+		                      std::uint64_t& a_outMask,
+		                      std::string& a_outMessage)
+		{
+			// Spec format: "PluginName|FormID" (hex). Resolve to BGSCollisionLayer,
+			// then derive both collisionIdx and a 64-bit collides-with mask.
+			const auto split = a_spec.find('|');
+			if (split == std::string::npos) {
+				a_outMessage = "bad spec format (expected ModName|FormID): " + a_spec;
+				return false;
+			}
+
+			const std::string modName = TrimCopy(a_spec.substr(0, split));
+			std::uint32_t localID = 0;
+			if (modName.empty() || !TryParseHex(a_spec.substr(split + 1), localID)) {
+				a_outMessage = "bad spec token(s): " + a_spec;
+				return false;
+			}
+
+			auto* dataHandler = RE::TESDataHandler::GetSingleton();
+			if (!dataHandler) {
+				a_outMessage = "TESDataHandler unavailable";
+				return false;
+			}
+
+			auto* layerForm = dataHandler->LookupForm<RE::BGSCollisionLayer>(localID, modName);
+
+			if (!layerForm) {
+				// Accept either local IDs or already-expanded IDs (FE/full plugin forms)
+				// so user config can follow common modding notation.
+				if (const auto* modFile = dataHandler->LookupModByName(modName)) {
+					std::uint32_t normalizedLocalID = localID;
+					bool hasNormalizedID = false;
+
+					if (modFile->IsLight()) {
+						if ((localID >> 12) == modFile->GetPartialIndex()) {
+							normalizedLocalID = localID & 0x00000FFF;
+							hasNormalizedID = true;
+						}
+					} else {
+						if ((localID >> 24) == modFile->GetCompileIndex()) {
+							normalizedLocalID = localID & 0x00FFFFFF;
+							hasNormalizedID = true;
+						}
+					}
+
+					if (hasNormalizedID && normalizedLocalID != localID) {
+						layerForm = dataHandler->LookupForm<RE::BGSCollisionLayer>(normalizedLocalID, modName);
+					}
+
+					if (!layerForm) {
+						const std::uint32_t localOnlyID = modFile->IsLight()
+							? (localID & 0x00000FFF)
+							: (localID & 0x00FFFFFF);
+						if (localOnlyID != 0 && localOnlyID != localID) {
+							layerForm = dataHandler->LookupForm<RE::BGSCollisionLayer>(localOnlyID, modName);
+						}
+					}
+				}
+			}
+
+			if (!layerForm) {
+				a_outMessage = "layer form not found: " + a_spec;
+				return false;
+			}
+
+			const std::uint32_t idx = layerForm->collisionIdx;
+			if (idx > 0x7F) {
+				a_outMessage = "collisionIdx out of range (must be <=127): " + std::to_string(idx);
+				return false;
+			}
+
+			std::uint64_t mask = 0;
+			// Runtime filter table is 64-bit; only indices [0,63] are represented here.
+			for (const auto* collidesWithLayer : layerForm->collidesWith) {
+				if (!collidesWithLayer) {
+					continue;
+				}
+				const std::uint32_t otherIdx = collidesWithLayer->collisionIdx;
+				if (otherIdx < 64) {
+					mask |= (std::uint64_t{ 1 } << otherIdx);
+				}
+			}
+
+			a_outLayer = static_cast<RE::COL_LAYER>(idx);
+			a_outResolvedFormID = layerForm->GetFormID();
+			a_outMask = mask;
+			a_outMessage = "ok";
+			return true;
+		}
+
+		void RefreshConfiguredCameraLayers()
+		{
+			// Re-read INI specs and publish resolved profile data used by Update()
+			// and ApplyCameraCollisionLayer() when toggling in menu.
+			RE::COL_LAYER enabledLayer = static_cast<RE::COL_LAYER>(kDefaultCameraLayerIndex);
+			RE::COL_LAYER disabledLayer = static_cast<RE::COL_LAYER>(kDefaultCameraLayerIndex);
+			std::uint32_t enabledResolvedForm = 0;
+			std::uint32_t disabledResolvedForm = 0;
+			std::uint64_t enabledMask = 0;
+			std::uint64_t disabledMask = 0;
+			std::string msg;
+
+			if (ResolveLayerSpec(Settings::EnabledCameraLayerSpec, enabledLayer, enabledResolvedForm, enabledMask, msg)) {
+				g_enabledCameraLayer.store(enabledLayer, std::memory_order_release);
+				g_enabledCameraLayerMask.store(enabledMask, std::memory_order_release);
+				Settings::LogEvent("[layer] enabled spec resolved: " + Settings::EnabledCameraLayerSpec +
+					" -> form=0x" + Hex8(enabledResolvedForm) +
+					" layerIdx=" + std::to_string(static_cast<std::uint32_t>(enabledLayer)) +
+					" mask=0x" + Hex16(enabledMask), true);
+			} else {
+				Settings::LogEvent("[layer] enabled spec failed: " + Settings::EnabledCameraLayerSpec + " reason=" + msg, true);
+			}
+
+			if (ResolveLayerSpec(Settings::DisabledCameraLayerSpec, disabledLayer, disabledResolvedForm, disabledMask, msg)) {
+				g_disabledCameraLayer.store(disabledLayer, std::memory_order_release);
+				g_disabledCameraLayerMask.store(disabledMask, std::memory_order_release);
+				Settings::LogEvent("[layer] disabled spec resolved: " + Settings::DisabledCameraLayerSpec +
+					" -> form=0x" + Hex8(disabledResolvedForm) +
+					" layerIdx=" + std::to_string(static_cast<std::uint32_t>(disabledLayer)) +
+					" mask=0x" + Hex16(disabledMask), true);
+			} else {
+				Settings::LogEvent("[layer] disabled spec failed: " + Settings::DisabledCameraLayerSpec + " reason=" + msg, true);
+			}
+
+			if (enabledLayer == disabledLayer && enabledMask == disabledMask) {
+				Settings::LogEvent("[layer] warning: enabled/disabled layerIdx are identical (" +
+					std::to_string(static_cast<std::uint32_t>(enabledLayer)) +
+					"). Toggle will not change camera collision behavior.", true);
+			} else if (enabledLayer == disabledLayer && enabledMask != disabledMask) {
+				Settings::LogEvent("[layer] info: enabled/disabled share same layerIdx but have different masks; runtime mask switching will be used.", true);
+			}
+		}
+
+		void ApplyCameraCollisionLayer(RE::COL_LAYER a_layer, std::uint64_t a_mask, const char* a_reason)
+		{
+			// Apply profile to both camera objects and global bhkCollisionFilter table.
+			// Updating layerBitfields[idx] is what makes same-layerIdx profiles diverge.
+			auto* camera = RE::PlayerCamera::GetSingleton();
+			if (!camera) {
+				Settings::LogEvent(std::string("[layer] apply skipped (") + a_reason + "): PlayerCamera unavailable", true);
+				return;
+			}
+
+			bool appliedToRoot = false;
+			bool appliedToRigidBody = false;
+			bool appliedToFilter = false;
+
+			if (auto* root = camera->cameraRoot.get()) {
+				root->SetCollisionLayer(a_layer);
+				appliedToRoot = true;
+			}
+
+			if (auto* body = camera->rigidBody.get()) {
+				if (auto* rigid = body->GetRigidBody()) {
+					if (auto* collidable = rigid->GetCollidableRW()) {
+						collidable->broadPhaseHandle.collisionFilterInfo.SetCollisionLayer(a_layer);
+						appliedToRigidBody = true;
+					}
+				}
+			}
+
+			if (auto* collisionFilter = RE::bhkCollisionFilter::GetSingleton()) {
+				const auto idx = static_cast<std::uint32_t>(a_layer);
+				if (idx < 64) {
+					collisionFilter->layerBitfields[idx] = a_mask;
+					appliedToFilter = true;
+				}
+			}
+
+			Settings::LogEvent(std::string("[layer] apply (") + a_reason + "): layerIdx=" +
+				std::to_string(static_cast<std::uint32_t>(a_layer)) +
+				" mask=0x" + Hex16(a_mask) +
+				" root=" + (appliedToRoot ? "1" : "0") +
+				" rigidBody=" + (appliedToRigidBody ? "1" : "0") +
+				" filter=" + (appliedToFilter ? "1" : "0"), true);
+		}
+	}
+
+	static void ResetRuntimeStateToVanilla()
+	{
+		g_hitObjects.clear();
+		g_publishedHits.store(nullptr, std::memory_order_release);
+		g_clipDistance.store(0.0f, std::memory_order_release);
+		g_forceVisRecord.store(nullptr, std::memory_order_release);
+		g_playerRoom.store(nullptr, std::memory_order_release);
+		OcclusionStripper::RestoreAll();
+		OcclusionStripper::SetStripped(false);
+
+		if (auto* sky = RE::Sky::GetSingleton()) {
+			if (auto* skyRoot = sky->root.get()) {
+				skyRoot->SetAppCulled(false);
+			}
+		}
+	}
 
 	// HookQPointWithin is defined further down (it depends on g_forceVisRecord/g_playerRoom
 	// declared above). Update needs to dispatch through its `func` trampoline to ask the
@@ -383,6 +636,12 @@ namespace Hooks
 		float scale = RE::bhkWorld::GetWorldScale();
 		RE::CFilter colFilter;
 		a_this->GetCollisionFilterInfo(colFilter);
+		const RE::COL_LAYER desiredLayer = Settings::IsModEnabled()
+			? g_enabledCameraLayer.load(std::memory_order_acquire)
+			: g_disabledCameraLayer.load(std::memory_order_acquire);
+		// Master toggle only selects which camera collision profile to cast with.
+		// All disocclusion hooks keep running regardless of this setting.
+		colFilter.SetCollisionLayer(desiredLayer);
 		// Age existing entries; new hits will reset to 0 below.
 		for (auto& [obj, entry] : g_hitObjects) {
 			entry.secondsSinceSeen += a_delta;
@@ -826,6 +1085,7 @@ namespace Hooks
 		if (!kEnableStripper) {
 			return;
 		}
+
 		// Position-displace lifecycle: displace once on toggle-on, refresh every
 		// 0.25s while active so shapes that come into the capsule as the player
 		// moves get caught. Restore-then-displace keeps the saved-position map
@@ -925,5 +1185,27 @@ namespace Hooks
 	void OnDataLoaded()
 	{
 		InstallClearRTVHook();
+		RefreshConfiguredCameraLayers();
+		const auto targetLayer = Settings::IsModEnabled()
+			? g_enabledCameraLayer.load(std::memory_order_acquire)
+			: g_disabledCameraLayer.load(std::memory_order_acquire);
+		const auto targetMask = Settings::IsModEnabled()
+			? g_enabledCameraLayerMask.load(std::memory_order_acquire)
+			: g_disabledCameraLayerMask.load(std::memory_order_acquire);
+		ApplyCameraCollisionLayer(targetLayer, targetMask, "data-loaded");
+	}
+
+	void OnFeatureToggleChanged(bool a_enabled)
+	{
+		// Toggle now means profile selection only; do not pause/reset runtime hooks.
+		RefreshConfiguredCameraLayers();
+		const auto targetLayer = a_enabled
+			? g_enabledCameraLayer.load(std::memory_order_acquire)
+			: g_disabledCameraLayer.load(std::memory_order_acquire);
+		const auto targetMask = a_enabled
+			? g_enabledCameraLayerMask.load(std::memory_order_acquire)
+			: g_disabledCameraLayerMask.load(std::memory_order_acquire);
+		ApplyCameraCollisionLayer(targetLayer, targetMask, a_enabled ? "toggle-enabled" : "toggle-disabled");
+		Settings::LogEvent(std::string("[runtime] camera profile selected: ") + (a_enabled ? "enabled" : "disabled"), true);
 	}
 }

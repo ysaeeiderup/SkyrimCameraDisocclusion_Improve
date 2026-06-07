@@ -40,6 +40,28 @@ target_include_directories(${PROJECT_NAME} PRIVATE src)
 target_precompile_headers(${PROJECT_NAME} PRIVATE src/pch.h)
 target_compile_definitions(${PROJECT_NAME} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 
+option(ENABLE_SKSE_MENU_FRAMEWORK "Enable SKSE Menu Framework integration" ON)
+
+if(ENABLE_SKSE_MENU_FRAMEWORK)
+    if(DEFINED ENV{SKSE_MENU_FRAMEWORK_HEADER_DIR} AND EXISTS "$ENV{SKSE_MENU_FRAMEWORK_HEADER_DIR}/SKSEMenuFramework.h")
+        set(SMF_INCLUDE_DIR "$ENV{SKSE_MENU_FRAMEWORK_HEADER_DIR}")
+    elseif(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../SKSE Menu Framework 3 Header (Fixed) (For Modders)/SKSEMenuFramework.h")
+        set(SMF_INCLUDE_DIR "${CMAKE_CURRENT_LIST_DIR}/../SKSE Menu Framework 3 Header (Fixed) (For Modders)")
+    elseif(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../SKSEMenuFramework 3.7 Header/SKSEMenuFramework.h")
+        set(SMF_INCLUDE_DIR "${CMAKE_CURRENT_LIST_DIR}/../SKSEMenuFramework 3.7 Header")
+    elseif(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../SKSE-Menu-Framework-SDK/Mods/SKSE Menu Framework DEV/SKSE/Plugins/SKSEMenuFramework.h")
+        set(SMF_INCLUDE_DIR "${CMAKE_CURRENT_LIST_DIR}/../SKSE-Menu-Framework-SDK/Mods/SKSE Menu Framework DEV/SKSE/Plugins")
+    endif()
+
+    if(DEFINED SMF_INCLUDE_DIR)
+        target_include_directories(${PROJECT_NAME} PRIVATE "${SMF_INCLUDE_DIR}")
+        target_compile_definitions(${PROJECT_NAME} PRIVATE SMF_ENABLED=1)
+        message(STATUS "SKSE Menu Framework header dir: ${SMF_INCLUDE_DIR}")
+    else()
+        message(WARNING "SKSE Menu Framework requested but SKSEMenuFramework.h was not found. Building without menu integration.")
+    endif()
+endif()
+
 if(DEFINED OUTPUT_FOLDER)
     set(DLL_FOLDER "${OUTPUT_FOLDER}/SKSE/Plugins")
 

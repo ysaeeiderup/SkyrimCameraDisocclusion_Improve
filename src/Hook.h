@@ -74,6 +74,7 @@ namespace Hooks
 	};
 
 	void Install();
+	void OnFeatureToggleChanged(bool a_enabled);
 
 	// Called from the SKSE messaging listener on kDataLoaded ??by then the
 	// renderer is alive and we can patch the D3D11 device-context vtable.
